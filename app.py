@@ -1,32 +1,58 @@
+import concurrent.futures
 import datetime as dt
 import json
+import math
 import os
 import urllib.parse
 import urllib.request
 import xml.etree.ElementTree as ET
 from dataclasses import dataclass
-from typing import List, Optional, Tuple
+from typing import Dict, List, Optional, Tuple
 
 import numpy as np
 import pandas as pd
 import streamlit as st
 
-st.set_page_config(page_title="ProQuant Live — Intraday, Delivery & Tracker", layout="wide")
+st.set_page_config(page_title="ProQuant NSE — Full Market Screener & Tracker", layout="wide")
 
 TRACKER_FILE = "active_delivery_trades.json"
 
-DEFAULT_WATCHLIST = [
-    "RELIANCE.NS",
-    "TCS.NS",
-    "HDFCBANK.NS",
-    "INFY.NS",
-    "ICICIBANK.NS",
-    "SBIN.NS",
-    "ITC.NS",
-    "LT.NS",
-    "BHARTIARTL.NS",
-    "AXISBANK.NS",
+NIFTY_50 = [
+    "ADANIENT.NS", "ADANIPORTS.NS", "APOLLOHOSP.NS", "ASIANPAINT.NS", "AXISBANK.NS",
+    "BAJAJ-AUTO.NS", "BAJFINANCE.NS", "BAJAJFINSV.NS", "BEL.NS", "BHARTIARTL.NS",
+    "BPCL.NS", "BRITANNIA.NS", "CIPLA.NS", "COALINDIA.NS", "DRREDDY.NS",
+    "EICHERMOT.NS", "GRASIM.NS", "HCLTECH.NS", "HDFCBANK.NS", "HDFCLIFE.NS",
+    "HEROMOTOCO.NS", "HINDALCO.NS", "HINDUNILVR.NS", "ICICIBANK.NS", "INDUSINDBK.NS",
+    "INFY.NS", "ITC.NS", "JSWSTEEL.NS", "KOTAKBANK.NS", "LT.NS",
+    "M&M.NS", "MARUTI.NS", "NESTLEIND.NS", "NTPC.NS", "ONGC.NS",
+    "POWERGRID.NS", "RELIANCE.NS", "SBILIFE.NS", "SBIN.NS", "SHRIRAMFIN.NS",
+    "SUNPHARMA.NS", "TATACONSUM.NS", "TATAMOTORS.NS", "TATASTEEL.NS", "TCS.NS",
+    "TECHM.NS", "TITAN.NS", "TRENT.NS", "ULTRACEMCO.NS", "WIPRO.NS",
 ]
+
+NIFTY_NEXT_50_AND_MIDCAPS = [
+    "ABB.NS", "ADANIENSOL.NS", "ADANIGREEN.NS", "ADANIPOWER.NS", "AMBUJACEM.NS",
+    "ATGL.NS", "BAJAJHLDNG.NS", "BANKBARODA.NS", "BOSCHLTD.NS", "CANBK.NS",
+    "CGPOWER.NS", "CHOLAFIN.NS", "COLPAL.NS", "DABUR.NS", "DIVISLAB.NS",
+    "DLF.NS", "DMART.NS", "GAIL.NS", "GODREJCP.NS", "HAL.NS",
+    "HAVELLS.NS", "ICICIGI.NS", "ICICIPRULI.NS", "INDIGO.NS", "IOC.NS",
+    "IRCTC.NS", "IRFC.NS", "JINDALSTEL.NS", "JIOFIN.NS", "LICI.NS",
+    "LODHA.NS", "LTIM.NS", "MARICO.NS", "MOTHERSON.NS", "NAUKRI.NS",
+    "NHPC.NS", "PFC.NS", "PIDILITIND.NS", "PNB.NS", "POLYCAB.NS",
+    "RECLTD.NS", "SBICARD.NS", "SHREECEM.NS", "SIEMENS.NS", "SRF.NS",
+    "TATAPOWER.NS", "TORNTPHARM.NS", "TVSMOTOR.NS", "UNIONBANK.NS", "UNITDSPR.NS",
+    "VBL.NS", "VEDL.NS", "ZOMATO.NS", "ZYDUSLIFE.NS", "AUROPHARMA.NS",
+    "BHEL.NS", "COFORGE.NS", "CUMMINSIND.NS", "DIXON.NS", "FEDERALBNK.NS",
+    "HDFCAMC.NS", "IDFCFIRSTB.NS", "INDUSTOWER.NS", "LUPIN.NS", "MANKIND.NS",
+    "MAXHEALTH.NS", "MPHASIS.NS", "MUTHOOTFIN.NS", "OBEROIRLTY.NS", "OFSS.NS",
+    "PAGEIND.NS", "PERSISTENT.NS", "PETRONET.NS", "PIIND.NS", "SUZLON.NS",
+]
+
+UNIVERSE_PRESETS = {
+    "Broad NSE Liquid (125 Stocks — Recommended)": NIFTY_50 + NIFTY_NEXT_50_AND_MIDCAPS,
+    "NIFTY 50 Only (50 Large-Caps)": NIFTY_50,
+    "NIFTY Next 50 & Top Midcaps (75 Stocks)": NIFTY_NEXT_50_AND_MIDCAPS,
+}
 
 POSITIVE_KEYWORDS = {
     "beat": 12, "surge": 10, "upgrade": 12, "outperform": 10, "order win": 14,
@@ -55,9 +81,6 @@ class QuantSignal:
     rsi14: float
     atr14: float
     volume_ratio: float
-    orb_high: float
-    orb_low: float
-    orb_status: str
     score: float
     reasons: List[str]
 
@@ -115,6 +138,28 @@ class StrategyCall:
     edge_label: str = "N/A"
 
 
+def _safe_float(val, default: float = 0.0) -> float:
+    try:
+        f = float(val)
+        return f if math.isfinite(f) else default
+    except Exception:
+        return default
+
+
+def _clean_ohlcv(df: pd.DataFrame) -> pd.DataFrame:
+    if df is None or df.empty:
+        return pd.DataFrame()
+    cols = [c for c in ["Open", "High", "Low", "Close", "Volume"] if c in df.columns]
+    if "Close" not in cols or "High" not in cols or "Low" not in cols:
+        return pd.DataFrame()
+    clean = df[cols].copy()
+    for c in cols:
+        clean[c] = pd.to_numeric(clean[c], errors="coerce")
+    clean = clean.dropna(subset=["Close", "High", "Low"])
+    clean = clean[(clean["Close"] > 0) & (clean["High"] > 0) & (clean["Low"] > 0)]
+    return clean
+
+
 def _ema(series: pd.Series, span: int) -> pd.Series:
     return series.ewm(span=span, adjust=False).mean()
 
@@ -125,86 +170,87 @@ def _rsi(series: pd.Series, period: int = 14) -> float:
     delta = series.diff()
     gain = delta.clip(lower=0).rolling(window=period).mean()
     loss = (-delta.clip(upper=0)).rolling(window=period).mean()
-    last_loss = float(loss.iloc[-1])
-    if last_loss == 0:
-        return 100.0
-    rs = float(gain.iloc[-1]) / last_loss
+    last_gain = _safe_float(gain.iloc[-1], 0.0)
+    last_loss = _safe_float(loss.iloc[-1], 0.0)
+    if last_loss == 0.0:
+        return 100.0 if last_gain > 0 else 50.0
+    rs = last_gain / last_loss
     return float(100.0 - (100.0 / (1.0 + rs)))
 
 
 def _atr(df: pd.DataFrame, period: int = 14) -> float:
     if len(df) < 2:
-        return float(df["High"].iloc[-1] - df["Low"].iloc[-1])
+        return max(_safe_float(df["High"].iloc[-1] - df["Low"].iloc[-1]), _safe_float(df["Close"].iloc[-1]) * 0.015)
     hl = df["High"] - df["Low"]
     hc = (df["High"] - df["Close"].shift()).abs()
     lc = (df["Low"] - df["Close"].shift()).abs()
     tr = pd.concat([hl, hc, lc], axis=1).max(axis=1)
-    val = tr.rolling(window=min(period, len(tr))).mean().iloc[-1]
-    return float(val) if pd.notna(val) else float(hl.iloc[-1])
+    val = _safe_float(tr.rolling(window=min(period, len(tr))).mean().iloc[-1], 0.0)
+    if val <= 0:
+        val = _safe_float(df["Close"].iloc[-1]) * 0.015
+    return val
 
 
-def analyze_quant(symbol: str, daily: pd.DataFrame, intraday: Optional[pd.DataFrame]) -> QuantSignal:
-    close = daily["Close"].astype(float)
-    last_p = float(close.iloc[-1])
-    prev_c = float(close.iloc[-2]) if len(close) >= 2 else last_p
+def analyze_quant(symbol: str, daily: pd.DataFrame) -> Optional[QuantSignal]:
+    df = _clean_ohlcv(daily)
+    if len(df) < 25:
+        return None
+
+    close = df["Close"]
+    last_p = _safe_float(close.iloc[-1], 0.0)
+    if last_p <= 0:
+        return None
+    prev_c = _safe_float(close.iloc[-2], last_p)
     change_pct = ((last_p - prev_c) / prev_c * 100.0) if prev_c > 0 else 0.0
 
-    ema9 = float(_ema(close, 9).iloc[-1])
-    ema21 = float(_ema(close, 21).iloc[-1])
-    ema50 = float(_ema(close, 50).iloc[-1])
+    ema9 = _safe_float(_ema(close, 9).iloc[-1], last_p)
+    ema21 = _safe_float(_ema(close, 21).iloc[-1], last_p)
+    ema50 = _safe_float(_ema(close, 50).iloc[-1], last_p)
     rsi14 = _rsi(close, 14)
-    atr14 = _atr(daily, 14)
+    atr14 = _atr(df, 14)
 
-    avg_vol20 = float(daily["Volume"].tail(20).mean()) if "Volume" in daily else 1.0
-    cur_vol = float(daily["Volume"].iloc[-1]) if "Volume" in daily else 1.0
-    vol_ratio = (cur_vol / avg_vol20) if avg_vol20 > 0 else 1.0
-
-    if intraday is not None and not intraday.empty:
-        orb_high = float(intraday["High"].iloc[0])
-        orb_low = float(intraday["Low"].iloc[0])
-        if last_p > orb_high:
-            orb_status = "Above 15m ORB High"
-        elif last_p < orb_low:
-            orb_status = "Below 15m ORB Low"
-        else:
-            orb_status = "Inside 15m ORB"
+    if "Volume" in df.columns:
+        avg_vol20 = _safe_float(df["Volume"].tail(20).mean(), 0.0)
+        cur_vol = _safe_float(df["Volume"].iloc[-1], 0.0)
+        vol_ratio = (cur_vol / avg_vol20) if avg_vol20 > 0 else 1.0
     else:
-        orb_high = float(daily["High"].iloc[-1])
-        orb_low = float(daily["Low"].iloc[-1])
-        orb_status = "Daily Range"
+        vol_ratio = 1.0
 
     score = 50.0
     reasons = []
-    if ema9 > ema21 > ema50:
-        score += 18
-        reasons.append("Strong bullish alignment (EMA 9 > 21 > 50)")
+    if ema9 > ema21 > ema50 and last_p > ema9:
+        score += 20
+        reasons.append("Strong bullish trend (Price > EMA 9 > 21 > 50)")
     elif ema9 > ema21:
-        score += 10
+        score += 11
         reasons.append("Short-term bullish crossover (EMA 9 > 21)")
     elif ema9 < ema21 < ema50:
-        score -= 15
-        reasons.append("Bearish trend (EMA 9 < 21 < 50)")
+        score -= 16
+        reasons.append("Bearish downtrend (EMA 9 < 21 < 50)")
 
-    if 42 <= rsi14 <= 64:
-        score += 10
+    if 45 <= rsi14 <= 65:
+        score += 12
         reasons.append(f"Healthy momentum RSI ({rsi14:.1f})")
-    elif rsi14 < 35:
-        score += 14
-        reasons.append(f"Oversold RSI ({rsi14:.1f}) bounce setup")
-    elif rsi14 > 72:
-        score -= 12
+    elif rsi14 < 34:
+        score += 13
+        reasons.append(f"Oversold RSI ({rsi14:.1f}) rebound setup")
+    elif rsi14 > 74:
+        score -= 14
         reasons.append(f"Overbought RSI ({rsi14:.1f}) — avoid chasing")
 
-    if vol_ratio >= 1.3:
-        score += 10
-        reasons.append(f"Volume surge ({vol_ratio:.1f}x 20D avg)")
+    if vol_ratio >= 1.35:
+        score += 12
+        reasons.append(f"Institutional volume surge ({vol_ratio:.1f}x 20D avg)")
+    elif vol_ratio >= 1.1:
+        score += 5
+        reasons.append(f"Above-average volume ({vol_ratio:.1f}x)")
 
-    if orb_status == "Above 15m ORB High":
-        score += 10
-        reasons.append("Intraday breakout above 15m Opening Range")
-    elif orb_status == "Below 15m ORB Low":
+    if change_pct > 0.5 and change_pct < 6.0:
+        score += 6
+        reasons.append(f"Positive price action (+{change_pct:.1f}%)")
+    elif change_pct <= -3.0:
         score -= 8
-        reasons.append("Below 15m Opening Range support")
+        reasons.append(f"Sharp daily drop ({change_pct:.1f}%)")
 
     return QuantSignal(
         symbol=symbol.upper(),
@@ -217,63 +263,60 @@ def analyze_quant(symbol: str, daily: pd.DataFrame, intraday: Optional[pd.DataFr
         rsi14=round(rsi14, 1),
         atr14=round(atr14, 2),
         volume_ratio=round(vol_ratio, 2),
-        orb_high=round(orb_high, 2),
-        orb_low=round(orb_low, 2),
-        orb_status=orb_status,
         score=float(np.clip(round(score, 1), 5, 98)),
-        reasons=reasons or ["Neutral technical setup"],
+        reasons=reasons or ["Neutral technical consolidation"],
     )
 
 
 def analyze_fundamentals(symbol: str, info: dict) -> FundamentalSignal:
-    name = info.get("shortName") or info.get("longName") or symbol
-    sector = info.get("sector") or "Unknown"
-    pe = float(info.get("trailingPE") or info.get("forwardPE") or 0.0)
-    roe = float(info.get("returnOnEquity") or 0.0) * 100.0
-    de = float(info.get("debtToEquity") or 0.0)
-    div_y = float(info.get("dividendYield") or 0.0) * 100.0
-    rev_g = float(info.get("revenueGrowth") or 0.0) * 100.0
+    name = info.get("shortName") or info.get("longName") or symbol.replace(".NS", "")
+    sector = info.get("sector") or "NSE Equity"
+    pe = _safe_float(info.get("trailingPE") or info.get("forwardPE"), 0.0)
+    roe = _safe_float(info.get("returnOnEquity"), 0.0) * 100.0
+    de = _safe_float(info.get("debtToEquity"), 0.0)
+    div_y = _safe_float(info.get("dividendYield"), 0.0) * 100.0
+    rev_g = _safe_float(info.get("revenueGrowth"), 0.0) * 100.0
 
     score = 50.0
     reasons = []
-    if 0 < pe <= 16:
+    if 0 < pe <= 18:
         score += 18
-        reasons.append(f"Attractive valuation (P/E {pe:.1f}x)")
-    elif 16 < pe <= 24:
+        reasons.append(f"Attractive P/E ({pe:.1f}x)")
+    elif 18 < pe <= 28:
         score += 10
-        reasons.append(f"Fair valuation (P/E {pe:.1f}x)")
-    elif pe > 40:
+        reasons.append(f"Reasonable P/E ({pe:.1f}x)")
+    elif pe > 50:
         score -= 14
-        reasons.append(f"Expensive valuation (P/E {pe:.1f}x)")
+        reasons.append(f"Expensive P/E ({pe:.1f}x)")
 
     if roe >= 18:
         score += 15
-        reasons.append(f"High ROE ({roe:.1f}%)")
+        reasons.append(f"Strong ROE ({roe:.1f}%)")
     elif roe >= 12:
         score += 8
-        reasons.append(f"Solid ROE ({roe:.1f}%)")
+        reasons.append(f"Healthy ROE ({roe:.1f}%)")
     elif 0 < roe < 8:
         score -= 8
         reasons.append(f"Weak ROE ({roe:.1f}%)")
 
     norm_de = de / 100.0 if de > 10 else de
-    if norm_de <= 0.5:
+    if 0 <= norm_de <= 0.6:
         score += 8
         reasons.append("Low debt balance sheet")
     elif norm_de > 1.5:
-        score -= 12
-        reasons.append(f"Elevated leverage (D/E {norm_de:.2f})")
+        score -= 10
+        reasons.append(f"Higher leverage (D/E {norm_de:.2f})")
 
     if rev_g >= 12:
         score += 10
         reasons.append(f"Strong revenue growth ({rev_g:.1f}% YoY)")
     elif rev_g < 0:
         score -= 10
-        reasons.append(f"Contracting revenue ({rev_g:.1f}% YoY)")
+        reasons.append(f"Declining revenue ({rev_g:.1f}% YoY)")
 
-    if div_y >= 2.0:
-        score += 6
-        reasons.append(f"Dividend cushion ({div_y:.2f}%)")
+    if div_y >= 1.5:
+        score += 5
+        reasons.append(f"Dividend yield ({div_y:.2f}%)")
 
     return FundamentalSignal(
         symbol=symbol.upper(),
@@ -290,14 +333,14 @@ def analyze_fundamentals(symbol: str, info: dict) -> FundamentalSignal:
 
 
 def analyze_news(symbol: str, company_name: str) -> NewsSignal:
-    encoded = urllib.parse.quote(f"{company_name or symbol} NSE stock")
+    encoded = urllib.parse.quote(f"{company_name or symbol.replace('.NS', '')} NSE stock")
     url = f"https://news.google.com/rss/search?q={encoded}&hl=en-IN&gl=IN&ceid=IN:en"
     headlines = []
     try:
         req = urllib.request.Request(url, headers={"User-Agent": "Mozilla/5.0"})
-        with urllib.request.urlopen(req, timeout=6) as resp:
+        with urllib.request.urlopen(req, timeout=5) as resp:
             root = ET.fromstring(resp.read())
-        for item in root.findall("./channel/item/title")[:6]:
+        for item in root.findall("./channel/item/title")[:5]:
             if item.text:
                 headlines.append(item.text.strip())
     except Exception:
@@ -321,27 +364,22 @@ def analyze_news(symbol: str, company_name: str) -> NewsSignal:
     return NewsSignal(symbol=symbol.upper(), score=score, sentiment_label=label, event_risk_flag=event_flag, top_headlines=headlines[:3])
 
 
-def run_backtest(df: pd.DataFrame, rr_ratio: float = 2.0) -> BacktestStats:
-    if df is None or len(df) < 40:
+def run_backtest(daily: pd.DataFrame, rr_ratio: float = 2.0) -> BacktestStats:
+    df = _clean_ohlcv(daily)
+    if len(df) < 40:
         return BacktestStats(0, 0.0, 0.0, 0.0, 0.0, "Insufficient Data")
 
-    close = df["Close"].astype(float)
-    high = df["High"].astype(float)
-    low = df["Low"].astype(float)
-    ema9 = _ema(close, 9)
-    ema21 = _ema(close, 21)
-
+    close, high, low = df["Close"], df["High"], df["Low"]
+    ema9, ema21 = _ema(close, 9), _ema(close, 21)
     delta = close.diff()
     gain = delta.clip(lower=0).rolling(14).mean()
     loss = (-delta.clip(upper=0)).rolling(14).mean()
     rsi14 = (100.0 - (100.0 / (1.0 + (gain / loss.replace(0, np.nan))))).fillna(50.0)
-
     tr = pd.concat([high - low, (high - close.shift()).abs(), (low - close.shift()).abs()], axis=1).max(axis=1)
     atr14 = tr.rolling(14).mean().bfill()
 
     cost = 0.0012
-    trades = []
-    in_trade = False
+    trades, in_trade = [], False
     entry_p = sl_p = tgt_p = 0.0
 
     for i in range(25, len(df)):
@@ -356,7 +394,7 @@ def run_backtest(df: pd.DataFrame, rr_ratio: float = 2.0) -> BacktestStats:
             continue
         if float(ema9.iloc[i]) > float(ema21.iloc[i]) and 42.0 <= float(rsi14.iloc[i]) <= 64.0:
             entry_p = c
-            stop_dist = max(float(atr14.iloc[i]) * 1.25, entry_p * 0.012)
+            stop_dist = max(_safe_float(atr14.iloc[i], entry_p * 0.015) * 1.25, entry_p * 0.012)
             sl_p = entry_p - stop_dist
             tgt_p = entry_p + stop_dist * rr_ratio
             in_trade = True
@@ -375,17 +413,17 @@ def run_backtest(df: pd.DataFrame, rr_ratio: float = 2.0) -> BacktestStats:
     max_dd = float(abs(dd.min()) * 100.0) if len(dd) else 0.0
     net_ret = float((eq[-1] - 1.0) * 100.0)
 
-    edge = "Verified Positive Edge" if (len(arr) >= 8 and win_rate >= 45.0 and pf >= 1.35) else ("Marginal Edge" if pf >= 1.0 else "Weak Historical Edge")
+    edge = "Verified Positive Edge" if (len(arr) >= 6 and win_rate >= 45.0 and pf >= 1.35) else ("Marginal Edge" if pf >= 1.0 else "Weak Historical Edge")
     return BacktestStats(len(arr), round(win_rate, 1), pf, round(net_ret, 1), round(max_dd, 1), edge)
 
 
 def build_intraday_call(q: QuantSignal, f: FundamentalSignal, n: NewsSignal, bt: BacktestStats) -> StrategyCall:
-    score = round(q.score * 0.70 + n.score * 0.30, 1)
-    warnings = ["Intraday trades carry high risk of rapid loss — always use a strict Stop-Loss and square off before 3:15 PM."]
+    score = round(q.score * 0.72 + n.score * 0.28, 1)
+    warnings = ["Intraday trades carry high risk of rapid loss — always set your Stop-Loss immediately and exit before 3:15 PM."]
     if n.event_risk_flag:
-        warnings.append("Major news/event headline detected — high gap/whipsaw risk.")
+        warnings.append("News/event headline active — higher intraday whipsaw risk.")
     if q.volume_ratio < 1.1:
-        warnings.append("Below-average volume — breakout may fail.")
+        warnings.append("Volume is below 20-day average — breakout confirmation is weaker.")
 
     if score >= 74 and q.ema9 > q.ema21 and n.score >= 45 and not n.event_risk_flag:
         action = "STRONG BUY"
@@ -397,11 +435,11 @@ def build_intraday_call(q: QuantSignal, f: FundamentalSignal, n: NewsSignal, bt:
         action = "AVOID"
 
     entry = q.last_price
-    sl_dist = max(entry * 0.006, min(q.atr14 * 0.75, entry * 0.015))
+    sl_dist = max(entry * 0.006, min(q.atr14 * 0.70, entry * 0.015))
     sl = round(entry - sl_dist, 2)
     t1 = round(entry + sl_dist * 1.5, 2)
     t2 = round(entry + sl_dist * 2.5, 2)
-    why = f"Quant {q.score}/100 ({q.reasons[0]}); {q.orb_status}; News {n.sentiment_label} ({n.score}/100)."
+    why = f"Quant {q.score}/100 ({q.reasons[0]}); Vol {q.volume_ratio}x; News {n.sentiment_label} ({n.score}/100)."
     return StrategyCall(q.symbol, f.company_name, f.sector, "INTRADAY", action, score, entry, sl, t1, t2, "1 : 1.5 (T1) / 1 : 2.5 (T2)", why, warnings, bt.win_rate_pct, bt.profit_factor, bt.edge_label)
 
 
@@ -412,9 +450,9 @@ def build_delivery_call(q: QuantSignal, f: FundamentalSignal, n: NewsSignal, bt:
     if falling_knife:
         warnings.append("Downtrend warning (below EMA 21 & 50) — high risk of capital getting stuck.")
     if n.score <= 40:
-        warnings.append("Negative news sentiment — wait for news clarity before delivery entry.")
+        warnings.append("Negative news sentiment — wait for clarity before delivery entry.")
     if n.event_risk_flag:
-        warnings.append("Event/earnings headline active — expect short-term volatility.")
+        warnings.append("Event/earnings headline active — expect short-term swings.")
 
     if score >= 70 and not falling_knife and f.score >= 60 and n.score >= 45:
         action = "STRONG BUY"
@@ -439,17 +477,17 @@ def evaluate_tracked_delivery(trade: dict, q: QuantSignal, n: NewsSignal) -> Tup
     pnl_pct = round(((ltp - entry) / entry) * 100.0, 2) if entry > 0 else 0.0
 
     if ltp <= sl:
-        return ("EXIT NOW — STOP-LOSS HIT", f"Price (₹{ltp}) breached Stop-Loss (₹{sl}). Exit to prevent deeper capital block.", pnl_pct, None)
+        return ("EXIT NOW — STOP-LOSS HIT", f"Price (₹{ltp}) breached Stop-Loss (₹{sl}). Exit to protect capital.", pnl_pct, None)
     if ltp >= t1:
         trail_sl = round(max(entry * 1.01, ltp - q.atr14 * 1.2), 2)
-        return ("BOOK PARTIAL / TRAIL SL", f"Target 1 (₹{t1}) hit (+{pnl_pct}%). Book partial profit or trail Stop-Loss to ₹{trail_sl}.", pnl_pct, trail_sl)
+        return ("BOOK PARTIAL / TRAIL SL", f"Target 1 (₹{t1}) hit (+{pnl_pct}%). Book partial profit or trail SL to ₹{trail_sl}.", pnl_pct, trail_sl)
     if n.score <= 36:
         return ("EXIT EARLY — NEGATIVE NEWS", f"News sentiment turned negative ({n.score}/100). Headlines: {'; '.join(n.top_headlines[:2])}", pnl_pct, None)
     if ltp < q.ema50 and q.ema9 < q.ema21 and pnl_pct < -2.0:
         return ("REVIEW / EXIT — TREND BROKE", f"Stock slipped below EMA 21 & 50 (LTP ₹{ltp}, P&L {pnl_pct}%). Dynamics weakened before SL.", pnl_pct, None)
     if pnl_pct >= 3.5:
         trail_sl = round(max(sl, entry * 1.005), 2)
-        return ("HOLD & TRAIL SL TO BREAKEVEN", f"Up +{pnl_pct}% with intact trend. Consider moving Stop-Loss from ₹{sl} to ₹{trail_sl}.", pnl_pct, trail_sl)
+        return ("HOLD & TRAIL SL TO BREAKEVEN", f"Up +{pnl_pct}% with intact trend. Consider raising Stop-Loss from ₹{sl} to ₹{trail_sl}.", pnl_pct, trail_sl)
     return ("HOLD — THESIS INTACT", f"Price ₹{ltp} ({pnl_pct:+.2f}%), Trend & News ({n.sentiment_label}) remain within plan. Keep SL at ₹{sl}.", pnl_pct, None)
 
 
@@ -475,36 +513,68 @@ def save_tracked_trades(trades: List[dict]) -> None:
         pass
 
 
-@st.cache_data(ttl=600, show_spinner=False)
-def scan_watchlist(symbols: Tuple[str, ...]):
+@st.cache_data(ttl=900, show_spinner=False)
+def scan_market_universe(symbols: Tuple[str, ...], top_n: int = 20):
+    """
+    2-Stage Institutional Funnel:
+    Stage 1: Fast bulk download of entire NSE universe -> Quant screen all stocks.
+    Stage 2: Deep Fundamentals + Live News + 2Y Backtest in parallel on the Top N candidates.
+    """
     import yfinance as yf
 
-    intraday_calls, delivery_calls = [], []
-    raw_map = {}
+    # Stage 1: Bulk download 1-year daily OHLCV for all tickers in parallel
+    data = yf.download(
+        list(symbols),
+        period="1y",
+        interval="1d",
+        group_by="ticker",
+        threads=True,
+        progress=False,
+        auto_adjust=False,
+    )
+
+    quant_results: List[Tuple[str, QuantSignal, pd.DataFrame]] = []
+    is_multi = isinstance(data.columns, pd.MultiIndex)
 
     for sym in symbols:
         try:
-            ticker = yf.Ticker(sym)
-            daily_2y = ticker.history(period="2y", interval="1d")
-            if daily_2y is None or daily_2y.empty or len(daily_2y) < 10:
+            sub = data[sym] if (is_multi and sym in data.columns.get_level_values(0)) else (data if not is_multi else None)
+            if sub is None or sub.empty:
                 continue
-            intraday = ticker.history(period="1d", interval="15m")
-            info = ticker.info or {}
-
-            q = analyze_quant(sym, daily_2y.tail(130), intraday)
-            f = analyze_fundamentals(sym, info)
-            n = analyze_news(sym, f.company_name)
-            bt = run_backtest(daily_2y, rr_ratio=2.0)
-
-            raw_map[sym] = (q, f, n)
-            intraday_calls.append(build_intraday_call(q, f, n, bt))
-            delivery_calls.append(build_delivery_call(q, f, n, bt))
+            q = analyze_quant(sym, sub)
+            if q is not None:
+                quant_results.append((sym, q, sub))
         except Exception:
             continue
 
+    total_scanned = len(quant_results)
+    # Pick top N by Quant score for deep Fundamental + News + Backtest scoring
+    quant_results.sort(key=lambda x: x[1].score, reverse=True)
+    shortlist = quant_results[:top_n]
+
+    def enrich(item):
+        sym, q, sub_df = item
+        try:
+            info = yf.Ticker(sym).info or {}
+        except Exception:
+            info = {}
+        f = analyze_fundamentals(sym, info)
+        n = analyze_news(sym, f.company_name)
+        bt = run_backtest(sub_df, rr_ratio=2.0)
+        return sym, q, f, n, bt
+
+    intraday_calls, delivery_calls = [], []
+    raw_map: Dict[str, Tuple[QuantSignal, FundamentalSignal, NewsSignal]] = {}
+
+    with concurrent.futures.ThreadPoolExecutor(max_workers=8) as pool:
+        for sym, q, f, n, bt in pool.map(enrich, shortlist):
+            raw_map[sym] = (q, f, n)
+            intraday_calls.append(build_intraday_call(q, f, n, bt))
+            delivery_calls.append(build_delivery_call(q, f, n, bt))
+
     intraday_calls.sort(key=lambda c: c.score, reverse=True)
     delivery_calls.sort(key=lambda c: c.score, reverse=True)
-    return intraday_calls, delivery_calls, raw_map
+    return total_scanned, intraday_calls, delivery_calls, raw_map
 
 
 def render_call_card(c: StrategyCall, allow_track: bool = False):
@@ -535,13 +605,13 @@ def render_call_card(c: StrategyCall, allow_track: bool = False):
 
         st.write(f"**Why:** {c.why}")
         if c.edge_label != "N/A":
-            st.caption(f"2Y Backtest Check: **{c.edge_label}** · Win Rate {c.win_rate_pct}% · Profit Factor {c.profit_factor}")
+            st.caption(f"1Y Backtest Check: **{c.edge_label}** · Win Rate {c.win_rate_pct}% · Profit Factor {c.profit_factor}")
         for w in c.warnings:
             st.warning(w)
 
 
-# --- App Layout ---
-st.title("ProQuant Live — Intraday, Delivery & Active Trade Tracker")
+# --- App UI ---
+st.title("ProQuant NSE — Broad Market Screener & Active Trade Tracker")
 st.info(
     "**Important Risk Disclosure:** No automated scanner or strategy is 100% error-free or guaranteed to make money. "
     "Use this tool for research, paper-trading, and disciplined Stop-Loss planning—not as guaranteed financial advice. "
@@ -549,46 +619,54 @@ st.info(
 )
 
 with st.sidebar:
-    st.header("Scanner Controls")
-    custom_tickers = st.text_area(
-        "NSE Watchlist (comma-separated, .NS suffix)",
-        value=", ".join(DEFAULT_WATCHLIST),
-        height=110,
-    )
-    if st.button("Refresh Live Market Scan", type="primary"):
+    st.header("Market Universe")
+    preset_name = st.selectbox("Select NSE Universe to Scan", list(UNIVERSE_PRESETS.keys()), index=0)
+    show_only_qualified = st.checkbox("Show Qualified Picks Only (BUY / STRONG BUY)", value=True)
+    extra_custom = st.text_input("Add Extra NSE/BSE Tickers (optional, e.g. ZOMATO.NS, RELIANCE.BO)")
+    if st.button("Refresh Full Market Scan", type="primary"):
         st.cache_data.clear()
 
-symbols = tuple(s.strip().upper() for s in custom_tickers.split(",") if s.strip())
+base_list = list(UNIVERSE_PRESETS[preset_name])
+if extra_custom.strip():
+    for s in extra_custom.split(","):
+        sym = s.strip().upper()
+        if sym and sym not in base_list:
+            base_list.append(sym)
 
-with st.spinner("Scanning live NSE prices, fundamentals & news..."):
-    intraday_calls, delivery_calls, raw_map = scan_watchlist(symbols)
+with st.spinner(f"Scanning {len(base_list)} NSE stocks (Stage 1 Quant -> Stage 2 Fundamentals, News & Backtest)..."):
+    total_scanned, intraday_calls, delivery_calls, raw_map = scan_market_universe(tuple(base_list), top_n=20)
+
+deliv_shown = [c for c in delivery_calls if c.action in ("STRONG BUY", "BUY")] if show_only_qualified else delivery_calls
+intra_shown = [c for c in intraday_calls if c.action in ("STRONG BUY", "BUY")] if show_only_qualified else intraday_calls
+
+st.caption(f"Scanned **{total_scanned} live NSE stocks** -> Shortlisted top 20 for deep Fundamental + News + Backtest verification.")
 
 tracked_list = load_tracked_trades()
 tab_delivery, tab_intraday, tab_tracker = st.tabs([
-    f"Delivery / Swing Calls ({len(delivery_calls)})",
-    f"Intraday Calls ({len(intraday_calls)})",
+    f"Delivery Qualified Picks ({len(deliv_shown)})",
+    f"Intraday Qualified Picks ({len(intra_shown)})",
     f"Active Delivery Tracker ({len(tracked_list)})",
 ])
 
 with tab_delivery:
-    st.subheader("Delivery / Positional Calls (Multi-Day to Multi-Week)")
-    st.caption("Filters out falling knives (below EMA 21 & 50) and weak fundamentals. Click 'Track Delivery' on any stock you buy so the tracker monitors news & trend changes for you.")
-    if not delivery_calls:
-        st.warning("No live data returned. Check ticker symbols or click Refresh.")
-    for call in delivery_calls:
+    st.subheader("Qualified Delivery / Swing Picks")
+    st.caption("Filtered from the full selected NSE universe. Excludes downtrends (below EMA 21/50), weak fundamentals, and negative news.")
+    if not deliv_shown:
+        st.info("No stocks currently meet the strict BUY criteria in this market session. Uncheck 'Show Qualified Picks Only' in the sidebar to see WATCH candidates.")
+    for call in deliv_shown:
         render_call_card(call, allow_track=True)
 
 with tab_intraday:
-    st.subheader("Intraday Calls (Same-Day Only — High Risk)")
-    st.caption("Strict momentum + volume + clean-news filter with tight Stop-Loss. Never carry a losing intraday trade overnight.")
-    if not intraday_calls:
-        st.warning("No live data returned. Check ticker symbols or click Refresh.")
-    for call in intraday_calls:
+    st.subheader("Qualified Intraday Momentum Picks (Same-Day Only)")
+    st.caption("Requires strong bullish alignment, clean news, and tight Stop-Loss. Never carry a losing intraday trade overnight.")
+    if not intra_shown:
+        st.info("No stocks currently meet the strict Intraday BUY criteria. Uncheck 'Show Qualified Picks Only' in the sidebar to see WATCH candidates.")
+    for call in intra_shown:
         render_call_card(call, allow_track=False)
 
 with tab_tracker:
     st.subheader("Active Delivery Trade Tracker (Live Re-Evaluation)")
-    st.caption("Checks your open delivery trades for Stop-Loss hits, Target hits, Trend breaks, or Negative News so your capital doesn't stay trapped.")
+    st.caption("Monitors your open delivery trades for Stop-Loss hits, Target hits, Trend breaks, or Negative News so your capital doesn't stay trapped.")
 
     with st.expander("+ Manually Log a Delivery Trade You Bought on Groww"):
         with st.form("add_manual_trade"):
@@ -615,7 +693,7 @@ with tab_tracker:
 
     tracked = load_tracked_trades()
     if not tracked:
-        st.info("No delivery trades being tracked yet. Click **Track Delivery** on any Delivery Call or add one manually above.")
+        st.info("No delivery trades being tracked yet. Click **Track Delivery** on any Delivery Pick or add one manually above.")
     else:
         import yfinance as yf
         for idx, tr in enumerate(tracked):
@@ -626,7 +704,7 @@ with tab_tracker:
                 try:
                     tkr = yf.Ticker(sym)
                     d = tkr.history(period="6mo", interval="1d")
-                    q = analyze_quant(sym, d, None) if d is not None and not d.empty else None
+                    q = analyze_quant(sym, d)
                     f = analyze_fundamentals(sym, tkr.info or {}) if q else None
                     n = analyze_news(sym, f.company_name if f else sym) if q else None
                 except Exception:
